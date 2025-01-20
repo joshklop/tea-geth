@@ -17,18 +17,29 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	cmath "github.com/ethereum/go-ethereum/common/math"
+	evmmath "github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto/kzg4844"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
+)
+
+// getL1DataCostCalldataPrefix is the calldata for a call to L1Block.getL1DataCost(bytes), excluding the data part.
+var getL1DataCostCalldataPrefix = append(
+	[]byte{0x03, 0x7e, 0x70, 0xfd}, // Selector
+	append(
+		evmmath.U256Bytes(big.NewInt(32)),    // Offset to data
+		evmmath.U256Bytes(big.NewInt(32))..., // Length of data
+	)...,
 )
 
 // ExecutionResult includes all output after executing given evm
@@ -255,23 +266,25 @@ func (st *StateTransition) buyGas() error {
 	mgval := new(big.Int).SetUint64(st.msg.GasLimit)
 	mgval.Mul(mgval, st.msg.GasPrice)
 	var l1Cost *big.Int
-	// TODO: This should be updated to Tea, or Isthmus if we merge into OP Mainnet.
-	if st.evm.ChainConfig().IsOptimismHolocene(st.evm.Context.Time) {
-		ZeroAddr := vm.AccountRef(common.HexToAddress("0x0000000000000000000000000000000000000000"))
-		L1BlockAddr := common.HexToAddress("0x4200000000000000000000000000000000000015")
-		GetL1DataCostSelector := []byte{0x01, 0x5d, 0x8e, 0xb9}
-		FixedCallGas := uint64(30_000)
-		returnBytes, _, vmerr := st.evm.StaticCall(ZeroAddr, L1BlockAddr, GetL1DataCostSelector, FixedCallGas)
-		if vmerr != nil {
-			return vmerr
-		}
-		if returnBytes != nil {
-			l1Cost.SetBytes(returnBytes)
-			mgval = mgval.Add(mgval, l1Cost)
-		}
-	}
 	if st.evm.Context.L1CostFunc != nil && !st.msg.SkipNonceChecks && !st.msg.SkipFromEOACheck {
-		l1Cost = st.evm.Context.L1CostFunc(st.msg.RollupCostData, st.evm.Context.Time)
+		// TODO: This should be updated to Tea, or Isthmus if we merge into OP Mainnet.
+		if st.evm.ChainConfig().IsOptimismFjord(st.evm.Context.Time) {
+			calldata := append(
+				getL1DataCostCalldataPrefix,
+				evmmath.U256Bytes(new(big.Int).SetUint64(st.msg.RollupCostData.FastLzSize))...,
+			)
+			returnBytes, _, err := st.evm.StaticCall(vm.AccountRef{}, types.L1BlockAddr, calldata, uint64(30_000))
+			if err != nil {
+				return fmt.Errorf("calculate l1 data cost: %v", err)
+			} else if returnBytes == nil {
+				return errors.New("l1 data cost calculation returned nil")
+			}
+			// SetBytes interprets the input as a big-endian unsigned integer.
+			// The return type of getL1DataCost is uint256, so directly using SetBytes is safe.
+			l1Cost = new(big.Int).SetBytes(returnBytes)
+		} else {
+			l1Cost = st.evm.Context.L1CostFunc(st.msg.RollupCostData, st.evm.Context.Time)
+		}
 		if l1Cost != nil {
 			mgval = mgval.Add(mgval, l1Cost)
 		}
